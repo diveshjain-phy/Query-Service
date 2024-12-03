@@ -9,7 +9,7 @@ Code Overview:
 """
 
 # Import all necessary libraries
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, HTTPException
 from sqlmodel import SQLModel, Field, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -30,6 +30,7 @@ from sqlalchemy import Column, TIMESTAMP
 class Observation(SQLModel, table=True):
     """
     Define the schema of the database table used for storing astronomical observations.
+
     Each instance of this class represents a single observation with attributes like source name,
     coordinates (RA, Dec), observation time, and flux measurements at various frequencies.
     """
@@ -61,6 +62,7 @@ class Observation(SQLModel, table=True):
 
 class Transient(BaseModel):
     """
+    Define properties of a transient source.
     This function contains methods to generate synthetic observations for it.
     """
 
@@ -139,6 +141,7 @@ async def synthcat(n: int, session: AsyncSession):
     """
     Populate the database with synthetic observations.
     """
+
     # Generate synthetic transient data
     transients = [
         Transient(
@@ -177,54 +180,28 @@ async def query_service(session: AsyncSession, flux_threshold: float):
 
 def export_to_hdf5(observations):
     """
-    Convert queried observations directly into an HDF5 file in memory using lists.
+    Export the the observations above a specified threshold to an HDF5 file.
     """
-    # Prepare data as lists
-    sources = [obs.source for obs in observations]  # Strings
-    ras = [obs.ra for obs in observations]
-    decs = [obs.dec for obs in observations]
-    observation_times = [str(obs.observation_time) for obs in observations]
-    flux_027s = [obs.flux_027 for obs in observations]
-    uncertainty_027s = [obs.uncertainty_027 for obs in observations]
-    flux_039s = [obs.flux_039 for obs in observations]
-    uncertainty_039s = [obs.uncertainty_039 for obs in observations]
-    flux_093s = [obs.flux_093 for obs in observations]
-    uncertainty_093s = [obs.uncertainty_093 for obs in observations]
-    flux_145s = [obs.flux_145 for obs in observations]
-    uncertainty_145s = [obs.uncertainty_145 for obs in observations]
-    flux_225s = [obs.flux_225 for obs in observations]
-    uncertainty_225s = [obs.uncertainty_225 for obs in observations]
-    flux_280s = [obs.flux_280 for obs in observations]
-    uncertainty_280s = [obs.uncertainty_280 for obs in observations]
-
-    # Use BytesIO to create an in-memory binary stream
     hdf5_buffer = io.BytesIO()
-
-    # Use h5py to write to the in-memory buffer
     with h5py.File(hdf5_buffer, 'w') as hdf5_file:
         group = hdf5_file.create_group('observations')
-        group.create_dataset('source', data=sources, dtype=h5py.special_dtype(vlen=str))
-        group.create_dataset('ra', data=ras)
-        group.create_dataset('dec', data=decs)
-        group.create_dataset(
-            'observation_time', data=observation_times, dtype=h5py.special_dtype(vlen=str)
-        )
-        group.create_dataset('flux_027', data=flux_027s)
-        group.create_dataset('uncertainty_027', data=uncertainty_027s)
-        group.create_dataset('flux_039', data=flux_039s)
-        group.create_dataset('uncertainty_039', data=uncertainty_039s)
-        group.create_dataset('flux_093', data=flux_093s)
-        group.create_dataset('uncertainty_093', data=uncertainty_093s)
-        group.create_dataset('flux_145', data=flux_145s)
-        group.create_dataset('uncertainty_145', data=uncertainty_145s)
-        group.create_dataset('flux_225', data=flux_225s)
-        group.create_dataset('uncertainty_225', data=uncertainty_225s)
-        group.create_dataset('flux_280', data=flux_280s)
-        group.create_dataset('uncertainty_280', data=uncertainty_280s)
+        # iterate over fields defined in the Observation model schema
+        for field in Observation.model_fields.keys():
+            data = [getattr(obs, field) for obs in observations]
 
-    # Reset the buffer's position to the start
+            if isinstance(data[0], int):
+                data = np.array(data, dtype='int')
+                dtype = np.int32
+            elif isinstance(data[0], float):
+                data = np.array(data, dtype='float64')
+                dtype = np.float64
+            else:
+                data = np.array(data, dtype='S')
+                dtype = h5py.special_dtype(vlen=str)
+
+            group.create_dataset(field, data=data, dtype=dtype)
+
     hdf5_buffer.seek(0)
-
     return hdf5_buffer
 
 
@@ -300,9 +277,20 @@ async def export_observations(
     flux_threshold: float = Query(3.0, description='Flux threshold for filtering'),
     session: AsyncSession = Depends(get_session),
 ):
+    """
+    Retrieve and export observations based on a flux threshold in an HDF5 file.
+    """
+    # Query the database to get observations
     observations = await query_service(session, flux_threshold)
+
+    # Check if observations list is empty
+    if not observations:
+        raise HTTPException(
+            status_code=404, detail='No data available for the given threshold.'
+        )
     hdf5_buffer = export_to_hdf5(observations)
 
+    # Return the data as a streaming response
     return StreamingResponse(
         hdf5_buffer,
         media_type='application/x-hdf5',
